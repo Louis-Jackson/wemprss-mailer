@@ -1,1 +1,1 @@
-# wempress-mailer
+# wemprss-mailer
