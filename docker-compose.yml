@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    image: wemprss-mailer:latest
+    container_name: wemprss-mailer
+    restart: unless-stopped
+    environment:
+      # Web server
+      - PORT=8080
+      # Optional auth for embedded console (can disable when using Access)
+      # - BASIC_AUTH_USER=admin
+      # - BASIC_AUTH_PASS=change-me
+      # Upstream API creds used by refresh/qr/login
+      - API_USERNAME
+      - API_PASSWORD
+      - API_BASE_URL
+      - MP_CODE
+      # Mail config
+      - MAIL_PASSWORD
+      - MAIL_SMTP_HOST
+      - MAIL_SMTP_PORT
+      - MAIL_FROM
+      - MAIL_ERROR_TO
+      - MAIL_TO
+      # QR proxy token placement customization (optional)
+      - QR_TOKEN_HEADER
+      - QR_TOKEN_PREFIX
+      - QR_TOKEN_COOKIE
+      - QR_TOKEN_QUERY
+      # Ensure scheduling (optional)
+      - ENSURE_ON_BOOT=true
+      - ENSURE_INTERVAL_SECONDS=0
+      # Over timeout (optional)
+      - POST_OVER_TIMEOUT_SECONDS=60
+    ports:
+      - "8080:8080"
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    depends_on:
+      - app
+    # 方案A：命名隧道（推荐生产）
+    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
+    # 方案B：临时隧道（开发）→ 将上面的 command 注释掉，改用：
+    # command: tunnel --no-autoupdate --protocol http2 --url http://app:8080
+    # For token-based tunnels, no extra volumes are needed. If you use named
+    # tunnels with credentials file, mount ~/.cloudflared instead and use
+    # `cloudflared tunnel run <name>`.
+
+

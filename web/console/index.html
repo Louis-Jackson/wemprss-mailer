@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>wemprss-mailer 控制台（独立版）</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }
+    button { padding: 8px 12px; margin-right: 8px; }
+    .row { margin: 12px 0; }
+    pre { background: #f6f8fa; padding: 12px; border-radius: 4px; overflow: auto; }
+  </style>
+  <script>
+    const API_BASE = (window.API_BASE || '') + '/api'; // 由反向代理将 /api 指到 Go 服务
+    async function call(path, opts={}) {
+      const url = API_BASE + path;
+      const res = await fetch(url, Object.assign({ method: 'GET', credentials: 'include' }, opts));
+      const text = await res.text();
+      try { return { ok: res.ok, data: JSON.parse(text) }; } catch (e) { return { ok: res.ok, data: text }; }
+    }
+    async function refreshStatus() {
+      const r = await call('/status');
+      document.getElementById('status').textContent = JSON.stringify(r.data, null, 2);
+    }
+    async function health() {
+      const r = await call('/health');
+      alert('health: ' + (r.ok ? 'ok' : 'bad'));
+    }
+    async function sendNow() {
+      const r = await call('/send-now', { method: 'POST' });
+      alert('send-now: ' + (r.ok ? 'ok' : JSON.stringify(r.data)));
+      refreshStatus();
+    }
+    async function triggerRefresh() {
+      const r = await call('/refresh', { method: 'POST' });
+      alert('refresh: ' + (r.ok ? 'ok' : JSON.stringify(r.data)));
+    }
+    async function ensure() {
+      const r = await call('/ensure', { method: 'POST' });
+      alert('ensure: ' + (r.ok ? 'ok' : JSON.stringify(r.data)));
+    }
+    window.addEventListener('load', refreshStatus);
+
+    // === QR login helpers ===
+    async function loadQr() {
+      const r = await call('/wx/auth/qr/code');
+      document.getElementById('qrstatus').textContent = JSON.stringify(r.data, null, 2);
+      const img = document.getElementById('qrimg');
+      try {
+        const codePath = r.data.data.code; // e.g. "static/wx_qrcode.png?..."
+        img.src = API_BASE + '/wx/auth/qr/' + codePath;
+      } catch (e) {
+        img.src = '';
+      }
+    }
+    let polling = null;
+    async function pollStatus() {
+      if (polling) return;
+      polling = setInterval(async () => {
+        const r = await call('/wx/auth/qr/status');
+        document.getElementById('qrstatus').textContent = JSON.stringify(r.data, null, 2);
+      }, 2000);
+    }
+    async function finishScan() {
+      const r = await call('/wx/auth/qr/over');
+      document.getElementById('qrstatus').textContent = JSON.stringify(r.data, null, 2);
+      if (polling) { clearInterval(polling); polling = null; }
+      alert('完成扫码：\n' + JSON.stringify(r.data, null, 2));
+    }
+  </script>
+</head>
+<body>
+  <h1>wemprss-mailer 控制台（独立版）</h1>
+  <div class="row">
+    <button onclick="health()">健康检查</button>
+    <button onclick="sendNow()">立即发送</button>
+    <button onclick="triggerRefresh()">刷新数据</button>
+    <button onclick="ensure()">确保最新（调用接口）</button>
+  </div>
+  <div class="row">
+    <h3>扫码登录</h3>
+    <div>
+      <button onclick="loadQr()">获取二维码</button>
+      <button onclick="pollStatus()">开始轮询状态</button>
+      <button onclick="finishScan()">完成扫码</button>
+    </div>
+    <div class="row">
+      <img id="qrimg" alt="二维码" style="width:240px;height:240px;border:1px solid #ddd;object-fit:contain" />
+    </div>
+    <pre id="qrstatus">未开始</pre>
+  </div>
+  <div class="row">
+    <h3>状态</h3>
+    <pre id="status">loading...</pre>
+  </div>
+</body>
+</html>
+
+

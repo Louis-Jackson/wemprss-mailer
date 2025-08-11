@@ -1,0 +1,38 @@
+# 示例：独立控制台 + Authelia Forward-Auth 保护 + 反代 Go API
+
+server {
+    listen 80;
+    server_name console.example.com;
+
+    # 与 Authelia 集成（参考你的 Authelia 部署文档）
+    location / {
+        # 先做 forward auth
+        auth_request /authelia_verify;  # 401/403 时由子段处理
+
+        # 静态控制台
+        root /var/www/wemprss-console;  # 将 web/console 部署到此
+        try_files $uri $uri/ /index.html;
+    }
+
+    location = /authelia_verify {
+        internal;
+        proxy_pass http://127.0.0.1:9091/api/verify;  # Authelia verify endpoint
+        proxy_set_header X-Original-Method $request_method;
+        proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $http_host;
+    }
+
+    # 反代 Go API（已在 Go 服务内置登录/代理逻辑）
+    location /api/ {
+        proxy_pass http://127.0.0.1:8080/api/; # Go 服务的内置端口
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_http_version 1.1;
+    }
+}
+
+
