@@ -41,12 +41,27 @@
 
     // === QR login helpers ===
     async function loadQr() {
-      const r = await call('/api/wx/auth/qr/code');
-      document.getElementById('qrstatus').textContent = JSON.stringify(r.data, null, 2);
       const img = document.getElementById('qrimg');
+      const first = await call('/api/wx/auth/qr/code');
+      document.getElementById('qrstatus').textContent = JSON.stringify(first.data, null, 2);
       try {
-        const codePath = r.data.data.code; // e.g. "static/wx_qrcode.png?..."
-        img.src = '/api/wx/auth/qr/' + codePath;
+        let codePath = first.data?.data?.code || '';
+        let isExists = first.data?.data?.is_exists;
+        // 若服务器提示图片尚未生成，则短暂轮询等待
+        if (isExists === false) {
+          const deadline = Date.now() + 6000; // 最多等 6s
+          while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 800));
+            const rr = await call('/api/wx/auth/qr/code');
+            document.getElementById('qrstatus').textContent = JSON.stringify(rr.data, null, 2);
+            codePath = rr.data?.data?.code || codePath;
+            isExists = rr.data?.data?.is_exists;
+            if (isExists === true) break;
+          }
+        }
+        const base = '/api/wx/auth/qr/' + (codePath || '');
+        const url = base + (base.includes('?') ? '&' : '?') + '_t=' + Date.now();
+        img.src = url;
       } catch (e) {
         // fallback
         img.src = '';

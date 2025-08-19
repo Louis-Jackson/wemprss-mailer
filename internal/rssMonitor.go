@@ -103,7 +103,7 @@ func Monitor() MonitorResult {
 			continue
 		}
 
-		if strings.Contains(title, "路透早报") && published.After(time.Now().Add(-24*time.Hour)) {
+		if strings.Contains(title, "路透早报") && published.After(time.Now().Add(-12*time.Hour)) {
 			log.Println("--------------------------------")
 			log.Println("title:", title)
 			log.Println("published time:", published.Format("2006-01-02 15:04:05"))

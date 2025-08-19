@@ -7,6 +7,7 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -82,6 +83,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "build upstream request failed")
 		return
+	}
+	// 对疑似二维码/图片资源增加 2s 延时，缓解上游生成/刷新未就绪的问题
+	if shouldDelayForPath(tail) {
+		time.Sleep(2 * time.Second)
 	}
 	if accept := r.Header.Get("Accept"); accept != "" {
 		req.Header.Set("Accept", accept)
@@ -163,7 +168,139 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// 若鉴权失败，强制刷新 token+cookie 重试一次
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		resp.Body.Close()
+		p.invalidateToken()
+		if token, err = p.getAccessToken(); err == nil && token != "" {
+			req2, _ := http.NewRequest(http.MethodGet, u.String(), nil)
+			if accept := r.Header.Get("Accept"); accept != "" {
+				req2.Header.Set("Accept", accept)
+			} else {
+				req2.Header.Set("Accept", "*/*")
+			}
+			hdr := os.Getenv("QR_TOKEN_HEADER")
+			if hdr == "" {
+				hdr = "Authorization"
+			}
+			prefix := os.Getenv("QR_TOKEN_PREFIX")
+			if prefix == "" {
+				prefix = "Bearer "
+			}
+			req2.Header.Set(hdr, prefix+token)
+			var cookieParts2 []string
+			if cn := strings.TrimSpace(os.Getenv("QR_TOKEN_COOKIE")); cn != "" {
+				cookieParts2 = append(cookieParts2, cn+"="+token)
+			}
+			if cookie := r.Header.Get("Cookie"); cookie != "" {
+				cookieParts2 = append(cookieParts2, cookie)
+			}
+			p.tokenMu.RLock()
+			if len(p.cachedCookies) > 0 {
+				cookieParts2 = append(cookieParts2, p.cachedCookies...)
+			}
+			p.tokenMu.RUnlock()
+			if len(cookieParts2) > 0 {
+				req2.Header.Set("Cookie", strings.Join(cookieParts2, "; "))
+			}
+			resp, err = p.client.Do(req2)
+			if err != nil {
+				writeJSONError(w, http.StatusBadGateway, err.Error())
+				return
+			}
+		}
+	}
+
+	// 针对 static/ 二维码图片，若 404 则短暂重试几次（上游可能尚未生成完毕）
+	if strings.HasPrefix(tail, "static/") && (resp.StatusCode == http.StatusNotFound) {
+		maxRetry := 3
+		interval := 700 * time.Millisecond
+		for i := 0; i < maxRetry && resp.StatusCode == http.StatusNotFound; i++ {
+			resp.Body.Close()
+			time.Sleep(interval)
+			reqR, _ := http.NewRequest(http.MethodGet, u.String(), nil)
+			if accept := r.Header.Get("Accept"); accept != "" {
+				reqR.Header.Set("Accept", accept)
+			} else {
+				reqR.Header.Set("Accept", "*/*")
+			}
+			hdr := os.Getenv("QR_TOKEN_HEADER")
+			if hdr == "" {
+				hdr = "Authorization"
+			}
+			prefix := os.Getenv("QR_TOKEN_PREFIX")
+			if prefix == "" {
+				prefix = "Bearer "
+			}
+			reqR.Header.Set(hdr, prefix+token)
+			var cookiePartsR []string
+			if cn := strings.TrimSpace(os.Getenv("QR_TOKEN_COOKIE")); cn != "" {
+				cookiePartsR = append(cookiePartsR, cn+"="+token)
+			}
+			if cookie := r.Header.Get("Cookie"); cookie != "" {
+				cookiePartsR = append(cookiePartsR, cookie)
+			}
+			p.tokenMu.RLock()
+			if len(p.cachedCookies) > 0 {
+				cookiePartsR = append(cookiePartsR, p.cachedCookies...)
+			}
+			p.tokenMu.RUnlock()
+			if len(cookiePartsR) > 0 {
+				reqR.Header.Set("Cookie", strings.Join(cookiePartsR, "; "))
+			}
+			resp, err = p.client.Do(reqR)
+			if err != nil {
+				writeJSONError(w, http.StatusBadGateway, err.Error())
+				return
+			}
+		}
+	}
+
 	defer resp.Body.Close()
+
+	// 若为二维码/图片资源，先保存到本地临时文件，再映射返回给客户端，最后自动删除
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if shouldPersistQRCode(tail, ct) && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// 生成带后缀的临时文件名
+		ext := guessImageExt(ct, u.Path)
+		pattern := "qrimg-*" + ext
+		f, ferr := os.CreateTemp(os.TempDir(), pattern)
+		if ferr == nil {
+			// 保存响应体到文件
+			_, _ = io.Copy(f, resp.Body)
+			_ = f.Close()
+			// 重新打开文件并回传
+			rf, rerr := os.Open(f.Name())
+			if rerr == nil {
+				defer rf.Close()
+				defer os.Remove(f.Name())
+				// 透传必要的头（与下方逻辑一致）
+				for k, vs := range resp.Header {
+					lk := strings.ToLower(k)
+					if lk == "content-type" || lk == "set-cookie" || strings.HasPrefix(lk, "cache-") || lk == "expires" || lk == "last-modified" || lk == "pragma" || lk == "content-disposition" || lk == "content-length" {
+						for _, v := range vs {
+							w.Header().Add(k, v)
+						}
+					}
+				}
+				// 显式设置 content-type（以防上游未返回）
+				if ct != "" {
+					w.Header().Set("Content-Type", ct)
+				}
+				// 禁止缓存，避免浏览器/中间层缓存旧二维码
+				w.Header().Set("Cache-Control", "no-store, max-age=0, must-revalidate")
+				w.Header().Set("Pragma", "no-cache")
+				w.Header().Del("Expires")
+				// 返回状态码与文件内容
+				w.WriteHeader(resp.StatusCode)
+				_, _ = io.Copy(w, rf)
+				return
+			}
+			// 若回传失败，清理文件后回退到直传逻辑
+			_ = os.Remove(f.Name())
+		}
+		// 若创建临时文件失败，则回退到直传逻辑
+	}
 
 	for k, vs := range resp.Header {
 		lk := strings.ToLower(k)
@@ -172,6 +309,12 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				w.Header().Add(k, v)
 			}
 		}
+	}
+	// 若为二维码/图片资源，强制不缓存，保证刷新时获取最新
+	if shouldPersistQRCode(tail, strings.ToLower(resp.Header.Get("Content-Type"))) {
+		w.Header().Set("Cache-Control", "no-store, max-age=0, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Del("Expires")
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
@@ -189,6 +332,68 @@ func escapeForJSON(s string) string {
 	s = strings.ReplaceAll(s, `"`, `\\"`)
 	s = strings.ReplaceAll(s, "\n", "\\n")
 	return s
+}
+
+// shouldPersistQRCode 判断是否需要先落盘再返回（针对二维码/图片类资源）
+func shouldPersistQRCode(requestTail string, contentType string) bool {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if strings.HasPrefix(ct, "image/") {
+		return true
+	}
+	// 根据路径与扩展名进行兜底判断
+	lowerPath := strings.ToLower(requestTail)
+	ext := strings.ToLower(path.Ext(lowerPath))
+	if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".bmp" || ext == ".webp" || ext == ".svg" {
+		return true
+	}
+	// 一些接口路径中可能包含 qr 或 qrcode 关键词
+	if strings.Contains(lowerPath, "/qr") || strings.Contains(lowerPath, "qrcode") {
+		return true
+	}
+	return false
+}
+
+// guessImageExt 根据 Content-Type 或 URL 路径猜测合适的图片扩展名
+func guessImageExt(contentType string, urlPath string) string {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	switch ct {
+	case "image/png":
+		return ".png"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/jpg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "image/bmp":
+		return ".bmp"
+	case "image/svg+xml":
+		return ".svg"
+	}
+	// 兜底：从路径扩展名推断
+	if ext := strings.ToLower(path.Ext(urlPath)); ext != "" {
+		return ext
+	}
+	return ".img"
+}
+
+// shouldDelayForPath 判断是否需要对上游请求增加小延时（主要针对二维码/图片生成尚未就绪的场景）
+func shouldDelayForPath(requestTail string) bool {
+	lower := strings.ToLower(requestTail)
+	// 明确包含 qr/qrcode 的路径
+	if strings.Contains(lower, "/qr") || strings.Contains(lower, "qrcode") {
+		return true
+	}
+	// 静态目录下的图片资源也可能是二维码
+	if strings.HasPrefix(lower, "static/") {
+		ext := strings.ToLower(path.Ext(lower))
+		if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".bmp" || ext == ".webp" || ext == ".svg" {
+			return true
+		}
+	}
+	return false
 }
 
 // getAccessToken 登录获取 access token，并做简单缓存
